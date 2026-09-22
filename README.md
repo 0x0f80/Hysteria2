@@ -1,6 +1,6 @@
 # hysteria2-setup
 
-Установка VPN-сервера **Hysteria2** (QUIC/UDP) одной командой. Обход DPI/ТСПУ, Salamander-обфускация, маскировка под www.microsoft.com.
+Установка VPN-сервера **Hysteria2** (QUIC/UDP) одной командой. Обход DPI/ТСПУ, Salamander-обфускация (трафик выглядит как случайный UDP).
 
 ## Установка
 
@@ -21,6 +21,8 @@ hystatus     # статус сервиса
 
 ## Клиенты
 
-Вставьте ссылку `hysteria2://...` в **NekoBox** (Android/Windows), **Hiddify** или **v2rayN**.
+Вставьте ссылку `hysteria2://...` в **v2rayNG** (Android), **v2rayN** (Windows), **NekoBox** или **Hiddify**.
 
-> Hysteria2 работает по UDP. Если сеть режет UDP — смените порт или сеть.
+> В ссылке есть отпечаток сертификата (`pinSHA256`) — с ним работают и клиенты на ядре Xray.
+
+> Hysteria2 работает по UDP. Если сеть режет UDP (часто — мобильные операторы), используйте [xray-reality-setup](https://github.com/0x0f80/xray-reality-setup).

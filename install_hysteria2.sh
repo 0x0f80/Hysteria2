@@ -2,10 +2,10 @@
 # =============================================================================
 #  Протокол: Hysteria2 (QUIC/UDP) — обход DPI в РФ
 #  Обфускация: Salamander (трафик выглядит как случайный UDP)
-#  Маскировка: www.microsoft.com (masquerade proxy при зондировании)
+#  Сертификат: самоподписанный, отпечаток закреплён в ссылке (pinSHA256)
 #
-#  Зачем: TLS-фильтрация ТСПУ (2026) ловит VLESS+Reality по TLS-рукопожатию.
-#  Hysteria2 идёт по UDP/QUIC мимо этой фильтрации + лучше держит пинг в играх.
+#  Зачем: UDP лучше держит пинг в играх, голос и видео. Работает там,
+#  где UDP не режут (обычно дома); на мобильных сетях его часто режут.
 #
 #  Запуск:
 #    bash install_hysteria2.sh
@@ -19,6 +19,7 @@ YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 
 ok()   { echo -e "${GREEN}[✓]${NC} $1"; }
 info() { echo -e "${YELLOW}[→]${NC} $1"; }
+warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 hdr()  {
   echo -e "\n${BLUE}════════════════════════════════════════${NC}"
@@ -35,8 +36,9 @@ CERT="$HYS_DIR/server.crt"
 KEY="$HYS_DIR/server.key"
 LINK_LIB="/usr/local/lib/hysteria_link.sh"
 BACKUP_DIR="$HYS_DIR/backups"
-# www.microsoft.com — SNI и цель masquerade:
-# корпоративный трафик, не блокируют, TLS 1.3, огромный объём
+# SNI и цель masquerade. С Salamander SNI в трафике не виден, а masquerade
+# отвечает только тем, кто знает пароль обфускации, — выбор домена здесь
+# некритичен (баг REALITY с сертификатом microsoft к Hysteria не относится)
 MASQ_DOMAIN="www.microsoft.com"
 MASQ_URL="https://www.microsoft.com/"
 
@@ -103,19 +105,29 @@ ok "UFW настроен (открыты: 22/tcp, 80/tcp, $HYS_PORT/udp)"
 # ── 5. Fail2Ban ───────────────────────────────────────────────────────────────
 hdr "НАСТРОЙКА FAIL2BAN"
 
-cat > /etc/fail2ban/jail.d/hysteria.conf << 'EOF'
+# На Debian 12 без rsyslog файла auth.log нет — тогда читаем журнал systemd
+if [ -f /var/log/auth.log ]; then
+  F2B_SOURCE="logpath  = /var/log/auth.log"
+else
+  F2B_SOURCE="backend  = systemd"
+fi
+
+cat > /etc/fail2ban/jail.d/hysteria.conf << EOF
 [sshd]
 enabled  = true
 port     = 22
 filter   = sshd
-logpath  = /var/log/auth.log
+$F2B_SOURCE
 maxretry = 3
 bantime  = 3600
 EOF
 
-systemctl enable fail2ban --quiet
-systemctl restart fail2ban
-ok "Fail2Ban запущен (SSH: макс 3 попытки, бан 1 час)"
+systemctl enable fail2ban --quiet || true
+if systemctl restart fail2ban; then
+  ok "Fail2Ban запущен (SSH: макс 3 попытки, бан 1 час)"
+else
+  warn "Fail2Ban не запустился — на работу VPN это не влияет"
+fi
 
 # ── 6. BBR + UDP-буферы ───────────────────────────────────────────────────────
 hdr "СЕТЕВОЙ ТЮНИНГ (BBR + UDP)"
@@ -132,8 +144,11 @@ grep -q 'net.core.rmem_max=16777216' /etc/sysctl.conf || {
   echo "net.core.wmem_max=16777216" >> /etc/sysctl.conf
 }
 
-sysctl -p -q
-ok "BBR включён, UDP-буферы увеличены (16 МБ)"
+if sysctl -p -q >/dev/null 2>&1; then
+  ok "BBR включён, UDP-буферы увеличены (16 МБ)"
+else
+  warn "Часть сетевых настроек не применилась (ограничение хостинга) — не критично"
+fi
 
 # ── 7. Nginx (порт 80 — легенда прикрытия и проверка доступности) ─────────────
 hdr "NGINX (легенда прикрытия)"
@@ -203,14 +218,32 @@ command -v hysteria &>/dev/null || err "Hysteria2 не установился, �
 HYS_VER=$(hysteria version 2>&1 | awk '/^Version:/ {print $2}' | head -1 || true)
 ok "Hysteria2 установлен ${HYS_VER:+($HYS_VER)}"
 
-# ── 9. Самоподписанный сертификат ─────────────────────────────────────────────
+# ── 9. Бэкап старой конфигурации ──────────────────────────────────────────────
+# До генерации сертификата и паролей — иначе в бэкап попадут уже новые
+hdr "БЭКАП"
+
+mkdir -p "$BACKUP_DIR"
+
+if [ -f "$HYS_CFG" ]; then
+  TS=$(date +%Y%m%d_%H%M%S)
+  cp "$HYS_CFG" "$BACKUP_DIR/config.yaml.$TS"
+  [ -f "$USERS" ] && cp "$USERS" "$BACKUP_DIR/users.json.$TS"
+  ok "Бэкап сохранён: $BACKUP_DIR/config.yaml.$TS"
+else
+  ok "Новая установка, бэкап не требуется"
+fi
+
+# ── 10. Самоподписанный сертификат ────────────────────────────────────────────
 hdr "ГЕНЕРАЦИЯ СЕРТИФИКАТА"
 
 mkdir -p "$HYS_DIR"
 
 # ECDSA prime256v1 — быстрый и лёгкий, CN = маскировочный домен.
-# Клиент подключается с insecure=1 (сертификат самоподписан), но трафик
-# всё равно зашифрован; настоящую скрытность обеспечивает Salamander-обфускация.
+# Сертификат самоподписан, поэтому в ссылку кладём его отпечаток (pinSHA256):
+# клиенты на ядре Xray (v2rayN, v2rayNG) проверяют именно его — allowInsecure
+# в Xray с 26.2.6 удалён. Клиенты на sing-box (NekoBox) идут по insecure=1.
+# SAN не добавляем: иначе включится sniGuard и начнёт рвать клиентов с другим
+# SNI. Xray при совпадении отпечатка имя в сертификате не проверяет.
 openssl ecparam -genkey -name prime256v1 -out "$KEY" 2>/dev/null
 openssl req -new -x509 -days 3650 -key "$KEY" -out "$CERT" \
   -subj "/CN=$MASQ_DOMAIN" 2>/dev/null
@@ -223,7 +256,7 @@ if id hysteria &>/dev/null; then
 fi
 ok "Сертификат создан (CN=$MASQ_DOMAIN, 10 лет)"
 
-# ── 10. Генерация паролей и пользователя ──────────────────────────────────────
+# ── 11. Генерация паролей и пользователя ─────────────────────────────────────
 hdr "ГЕНЕРАЦИЯ КЛЮЧЕЙ"
 
 # Пароль обфускации — общий для всего сервера (пресекретный ключ Salamander)
@@ -245,20 +278,6 @@ EOF
 chmod 600 "$PARAMS"
 
 ok "Ключи сгенерированы (обфускация + пользователь main)"
-
-# ── 11. Бэкап старой конфигурации ─────────────────────────────────────────────
-hdr "БЭКАП"
-
-mkdir -p "$BACKUP_DIR"
-
-if [ -f "$HYS_CFG" ]; then
-  TS=$(date +%Y%m%d_%H%M%S)
-  cp "$HYS_CFG" "$BACKUP_DIR/config.yaml.$TS"
-  [ -f "$USERS" ] && cp "$USERS" "$BACKUP_DIR/users.json.$TS"
-  ok "Бэкап сохранён: $BACKUP_DIR/config.yaml.$TS"
-else
-  ok "Новая установка, бэкап не требуется"
-fi
 
 # ── 12. Библиотека генерации ссылок и конфига ─────────────────────────────────
 hdr "БИБЛИОТЕКА ССЫЛОК"
@@ -336,7 +355,15 @@ gen_link() {
     [ -z "$ip" ] && { echo -e "${RED}Не удалось определить IP сервера${NC}" >&2; return 1; }
   fi
 
-  echo "hysteria2://${user}:${pass}@${ip}:${HYS_PORT}/?insecure=1&obfs=salamander&obfs-password=${OBFS_PASSWORD}&sni=${SNI}#${user}"
+  # Отпечаток сертификата: SHA-256 от DER, hex без двоеточий
+  local pin
+  pin=$(openssl x509 -in "$HYS_DIR/server.crt" -noout -fingerprint -sha256 2>/dev/null |         cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f')
+  if [ ${#pin} -ne 64 ]; then
+    echo -e "${RED}Не удалось прочитать отпечаток сертификата${NC}" >&2
+    return 1
+  fi
+
+  echo "hysteria2://${user}:${pass}@${ip}:${HYS_PORT}/?insecure=1&pinSHA256=${pin}&obfs=salamander&obfs-password=${OBFS_PASSWORD}&sni=${SNI}#${user}"
 }
 export -f gen_link
 LINKLIB
@@ -554,6 +581,8 @@ echo ""
 echo -e "${CYAN}Версия:${NC} $(hysteria version 2>&1 | awk '/^Version:/ {print $2}' | head -1)"
 echo -e "${CYAN}Порт:${NC} $HYS_PORT/udp"
 echo -e "${CYAN}Обфускация:${NC} salamander"
+echo -e "${CYAN}Отпечаток сертификата (pinSHA256):${NC}"
+openssl x509 -in "$HYS_DIR/server.crt" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f'
 echo ""
 SCRIPT
 chmod +x /usr/local/bin/hystatus
@@ -610,9 +639,9 @@ show_help() {
   echo -e "${CYAN}║${NC}    journalctl -u hysteria-server -f   — логи            ${CYAN}║${NC}"
   echo -e "${CYAN}║${NC}                                                        ${CYAN}║${NC}"
   echo -e "${CYAN}║${NC}  ${GREEN}КЛИЕНТЫ (поддержка Hysteria2):${NC}                        ${CYAN}║${NC}"
-  echo -e "${CYAN}║${NC}    Android:  NekoBox, Hiddify                           ${CYAN}║${NC}"
+  echo -e "${CYAN}║${NC}    Android:  v2rayNG, NekoBox, Hiddify                  ${CYAN}║${NC}"
   echo -e "${CYAN}║${NC}    iOS:      Streisand, Shadowrocket                    ${CYAN}║${NC}"
-  echo -e "${CYAN}║${NC}    Windows:  NekoBox, v2rayN, Hiddify                   ${CYAN}║${NC}"
+  echo -e "${CYAN}║${NC}    Windows:  v2rayN (ядро Xray или sing-box), Hiddify   ${CYAN}║${NC}"
   echo -e "${CYAN}║${NC}    macOS:    Hiddify, V2Box                             ${CYAN}║${NC}"
   echo -e "${CYAN}║${NC}                                                        ${CYAN}║${NC}"
   echo -e "${CYAN}╚════════════════════════════════════════════════════════╝${NC}"
@@ -668,7 +697,7 @@ echo ""
 hymain
 
 echo -e "${YELLOW}Следующие шаги:${NC}"
-echo "  1. Скопируйте ссылку в NekoBox / Hiddify / v2rayN"
+echo "  1. Скопируйте ссылку в v2rayN / v2rayNG / NekoBox / Hiddify"
 echo "  2. Меню управления:      h"
 echo "  3. Создать пользователя: hynewuser"
 echo "  4. Список пользователей: hyuserlist"
