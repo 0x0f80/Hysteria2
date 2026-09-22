@@ -3,6 +3,7 @@
 #  Протокол: Hysteria2 (QUIC/UDP) — обход DPI в РФ
 #  Обфускация: Salamander (трафик выглядит как случайный UDP)
 #  Сертификат: самоподписанный, отпечаток закреплён в ссылке (pinSHA256)
+#  Скорость: BBR для всех клиентов (ignoreClientBandwidth)
 #
 #  Зачем: UDP лучше держит пинг в играх, голос и видео. Работает там,
 #  где UDP не режут (обычно дома); на мобильных сетях его часто режут.
@@ -321,6 +322,10 @@ rebuild_config() {
     echo "  userpass:"
     jq -r 'to_entries[] | "    \(.key): \(.value)"' "$USERS"
     echo ""
+    # BBR для всех клиентов: Brutal при потерях шлёт ещё больше и выделяется
+    # ровным потоком без пауз — ТСПУ это замечает. Скорость из клиента игнорируем.
+    echo "ignoreClientBandwidth: true"
+    echo ""
     echo "masquerade:"
     echo "  type: proxy"
     echo "  proxy:"
@@ -581,6 +586,7 @@ echo ""
 echo -e "${CYAN}Версия:${NC} $(hysteria version 2>&1 | awk '/^Version:/ {print $2}' | head -1)"
 echo -e "${CYAN}Порт:${NC} $HYS_PORT/udp"
 echo -e "${CYAN}Обфускация:${NC} salamander"
+echo -e "${CYAN}Скорость:${NC} BBR — подстраивается сама (настройки клиентов игнорируются)"
 echo -e "${CYAN}Отпечаток сертификата (pinSHA256):${NC}"
 openssl x509 -in "$HYS_DIR/server.crt" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f'
 echo ""
@@ -692,6 +698,7 @@ echo -e "  ${GREEN}Порт:${NC}         $HYS_PORT/udp"
 echo -e "  ${GREEN}Протокол:${NC}     Hysteria2 (QUIC)"
 echo -e "  ${GREEN}Обфускация:${NC}   Salamander"
 echo -e "  ${GREEN}Маскировка:${NC}   $MASQ_DOMAIN"
+echo -e "  ${GREEN}Скорость:${NC}     BBR (подстраивается сама)"
 echo ""
 
 hymain
